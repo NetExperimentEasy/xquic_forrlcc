@@ -45,11 +45,17 @@ typedef struct xqc_rlcc_s {
     // rlcc_flag : for mininet env
     uint32_t                rlcc_path_flag;
 
-    // satcc action space
+    // satcc action old space plan3
     uint32_t                cwnd_int;
     uint8_t                 up_times;
     uint8_t                 down_times;
     uint8_t                 up_n;
+
+    // satcc action new space plan4
+    uint32_t                up_change_EMA;
+	uint32_t                up_stay_EMA;
+	uint32_t                down_change_EMA;
+	uint32_t                down_stay_EMA;
 
     // cacu throughput by total_sent
     uint64_t                before_total_sent;

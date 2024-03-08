@@ -1452,11 +1452,11 @@ int main(int argc, char *argv[]) {
     } else if (c_cong_ctl == 'P') {
         cong_ctrl = xqc_copa_cb;
     } 
-#ifdef XQC_ENABLE_BBR2
     /* add rlcc here */
     else if (c_cong_ctl == 'R') {
         cong_ctrl = xqc_rlcc_cb;
     }
+#ifdef XQC_ENABLE_BBR2
     else if (c_cong_ctl == 'B') {
         cong_ctrl = xqc_bbr2_cb;
 #if XQC_BBR2_PLUS_ENABLED

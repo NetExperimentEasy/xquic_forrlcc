@@ -28,7 +28,6 @@
 #define XQC_DEFAULT_PACING_RATE (((2 * XQC_MSS * 1000000ULL)/(XQC_kInitialRtt * 1000)))
 
 const float xqc_rlcc_init_pacing_gain = 2.885;
-const uint64_t xqc_max = ~0;
 
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t mutex_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -37,6 +36,8 @@ static pthread_mutex_t mutex_lock = PTHREAD_MUTEX_INITIALIZER;
 static int up_actions_list[8] = {30,150,750,3750,18750,93750,468750,2343750};
 static int down_actions_list[8] = {1,3,5,9,15,21,33,51};
 
+const uint64_t xqc_pacing_rate_max = (~0) / (uint64_t)MSEC2SEC;
+const uint64_t xqc_cwnd_max = (~0) / (uint64_t)MSEC2SEC;
 
 /* see xqc_pacing.c xqc_pacing_rate_calc */
 static void
@@ -47,7 +48,7 @@ xqc_rlcc_calc_pacing_rate_by_cwnd(xqc_rlcc_t *rlcc)
         srtt = XQC_kInitialRtt * 1000;
     }
 	rlcc->pacing_rate = (rlcc->cwnd * (uint64_t)MSEC2SEC / srtt);
-	rlcc->pacing_rate = xqc_clamp(rlcc->pacing_rate, XQC_DEFAULT_PACING_RATE, xqc_max);
+	rlcc->pacing_rate = xqc_clamp(rlcc->pacing_rate, XQC_DEFAULT_PACING_RATE, xqc_pacing_rate_max);
 	return;
 }
 
@@ -60,7 +61,7 @@ xqc_rlcc_calc_cwnd_by_pacing_rate(xqc_rlcc_t *rlcc)
         srtt = XQC_kInitialRtt * 1000;
     }
 	rlcc->cwnd = CWND_GAIN * (rlcc->pacing_rate * srtt / (uint64_t)MSEC2SEC);
-	rlcc->cwnd = xqc_clamp(rlcc->cwnd, XQC_RLCC_MIN_WINDOW, xqc_max);
+	rlcc->cwnd = xqc_clamp(rlcc->cwnd, XQC_RLCC_MIN_WINDOW, xqc_cwnd_max);
 	return;
 }
 
@@ -106,6 +107,12 @@ push_state(redisContext *conn, u_int32_t key, char *value)
 	return;
 }
 
+uint32_t
+EMA(uint32_t new, uint32_t old, uint32_t rate) // rate 4, 8
+{
+	return new/rate + (rate-1)*old/rate;
+}
+
 /* get action from redis */
 static void
 get_result_from_reply(redisReply *reply, xqc_rlcc_t *rlcc)
@@ -114,12 +121,14 @@ get_result_from_reply(redisReply *reply, xqc_rlcc_t *rlcc)
 	float pacing_rate_rate;
 	int cwnd_value;
 
-	int plan = 3; 
+	int plan = 2;
 	/* TODO: use *function to replace plan */
 
 	// plan 1 : control by multiply rate; 
 	// plan 2 : control by add rate; owl action space
-	// plan 3 : satcc action space
+	// plan 3 : satcc action space old
+	// plan 4 : satcc action space new
+
 
 	if (reply->type == REDIS_REPLY_ARRAY)
 	{
@@ -129,20 +138,28 @@ get_result_from_reply(redisReply *reply, xqc_rlcc_t *rlcc)
 		if (plan==1) {
 			// cwnd_rate : [0.5, 3], pacing_rate_rate : [0.5, 3]; if value is 0, means that set it auto
 			sscanf(reply->element[2]->str, "%f,%f", &cwnd_rate, &pacing_rate_rate);
-
+			// printf("cwnd_rate %f, pacing_rate_rate:%f, cwnd:%lu, pacing_rate:%lu\n", cwnd_rate, pacing_rate_rate, rlcc->cwnd, rlcc->pacing_rate);
 			if (cwnd_rate != 0)
 			{
-				rlcc->cwnd *= cwnd_rate;
-				if (rlcc->cwnd < XQC_RLCC_MIN_WINDOW)
+				if (xqc_cwnd_max / cwnd_rate < rlcc->cwnd) // 判断倍率会导致cwnd溢出的情况
 				{
-					rlcc->cwnd = XQC_RLCC_MIN_WINDOW; // base cwnd
+					rlcc->cwnd = xqc_cwnd_max - 1;
+				}else {
+					rlcc->cwnd *= cwnd_rate;
 				}
+				rlcc->cwnd = xqc_clamp(rlcc->cwnd, XQC_RLCC_MIN_WINDOW, xqc_cwnd_max);
 			}
 
 			if (pacing_rate_rate != 0)
 			{ // use pacing
-				rlcc->pacing_rate *= pacing_rate_rate;
-				// TODO: base pacing rate needed
+				if (xqc_pacing_rate_max / pacing_rate_rate < rlcc->pacing_rate) // 判断倍率会导致速率溢出的情况
+				{
+					rlcc->pacing_rate = xqc_pacing_rate_max - 1;
+				}else {
+					rlcc->pacing_rate *= pacing_rate_rate;
+				}
+				// 上下限约束
+				rlcc->pacing_rate = xqc_clamp(rlcc->pacing_rate, XQC_DEFAULT_PACING_RATE, xqc_pacing_rate_max);
 			}
 
 			if (cwnd_rate == 0)
@@ -153,11 +170,6 @@ get_result_from_reply(redisReply *reply, xqc_rlcc_t *rlcc)
 			if (pacing_rate_rate == 0)
 			{ // use cwnd update pacing_rate
 				xqc_rlcc_calc_pacing_rate_by_cwnd(rlcc);
-			}
-
-			if (rlcc->cwnd < XQC_RLCC_MIN_WINDOW)
-			{
-				rlcc->cwnd = XQC_RLCC_MIN_WINDOW; // base cwnd
 			}
 		}
 		
@@ -245,6 +257,41 @@ get_result_from_reply(redisReply *reply, xqc_rlcc_t *rlcc)
 			xqc_rlcc_calc_pacing_rate_by_cwnd(rlcc);
 		}
 
+		if (plan == 4) {
+			// [-1, 0, 1]   satcc action new space
+			int tmp;
+			sscanf(reply->element[2]->str, "%d", &cwnd_value);
+
+			// satcc action
+			if (cwnd_value == 0) {
+				rlcc->up_stay_EMA = EMA(50000, rlcc->up_stay_EMA, 4);
+				rlcc->up_change_EMA = EMA(50000, rlcc->up_change_EMA, 4);
+				rlcc->down_stay_EMA = EMA(50000, rlcc->down_stay_EMA, 4);
+				rlcc->down_change_EMA = EMA(50000, rlcc->down_change_EMA, 4);
+			}else if (cwnd_value == 1) {
+				rlcc->up_change_EMA = EMA(100000, rlcc->up_change_EMA, 16);
+				rlcc->up_stay_EMA = EMA(2000, rlcc->up_stay_EMA, 16);
+				rlcc->down_change_EMA = EMA(50000, rlcc->down_change_EMA, 4);
+				cwnd_value = (int)(rlcc->up_change_EMA/rlcc->up_stay_EMA)+1;
+			}else if (cwnd_value == -1) {
+				rlcc->down_stay_EMA = EMA(2000, rlcc->down_stay_EMA, 16);
+                rlcc->down_change_EMA = EMA(100000, rlcc->down_change_EMA, 16);
+                rlcc->up_change_EMA = EMA(50000, rlcc->up_change_EMA, 4);
+                cwnd_value = -(int)(rlcc->down_change_EMA/rlcc->down_stay_EMA)-1;
+			}
+
+			tmp = cwnd_value > 0 ? cwnd_value : -cwnd_value;
+			if (rlcc->cwnd_int >= tmp || cwnd_value > 0){
+				rlcc->cwnd_int += cwnd_value;
+			}
+			if (rlcc->cwnd_int < XQC_RLCC_MIN_WINDOW_INT)
+			{
+				rlcc->cwnd_int = XQC_RLCC_MIN_WINDOW_INT; // base cwnd
+			}
+			rlcc->cwnd = rlcc->cwnd_int * XQC_RLCC_MSS;
+			xqc_rlcc_calc_pacing_rate_by_cwnd(rlcc);
+		}
+
 		// printf("after cwnd is %d, pacing_rate is %d\n", rlcc->cwnd, rlcc->pacing_rate);
 	}
 
@@ -318,11 +365,17 @@ xqc_rlcc_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params
 	rlcc->sent_timestamp = xqc_monotonic_timestamp();
 	rlcc->before_total_sent = 0;
 
-	// for satcc action
+	// for satcc action old
 	rlcc->cwnd_int = XQC_RLCC_INIT_WIN_INT;
 	rlcc->up_n = 0;
 	rlcc->down_times = 0;
 	rlcc->up_times = 0;
+
+	// for satcc action new
+	rlcc->up_change_EMA = 1000; // 0.1
+	rlcc->up_stay_EMA = 1000;
+	rlcc->down_change_EMA = 1000;
+	rlcc->down_stay_EMA = 1000;
 
 	xqc_rlcc_calc_pacing_rate_by_cwnd(rlcc);
 	rlcc->prior_pacing_rate = rlcc->pacing_rate;
@@ -419,14 +472,16 @@ xqc_rlcc_on_ack(void *cong_ctl, xqc_sample_t *sampler)
 
 	probe_minrtt(rlcc, sampler);
 
-	int plan = 2; // plan 1 100ms; plan 2 double rtt sample
+	int plan = 2; // plan 1 100ms; plan 2 minrtt+100；plan 3 double rtt sample
 
 	/* TODO: use *function to replace plan */
 
 	if (plan == 1)
 	{
 		/* plan1. 100ms fixed monitor interval (get data from xqc_sampler) */ 
-		if (rlcc->timestamp + SAMPLE_INTERVAL <= current_time)
+		// if (rlcc->timestamp + SAMPLE_INTERVAL <= current_time) // 100ms
+		// if (rlcc->timestamp + (SAMPLE_INTERVAL/2) <= current_time)  // 50ms
+		if (rlcc->timestamp + rlcc->min_rtt <= current_time)  // 1 minrtt
 		{ // 100000 100ms
 
 			rlcc->timestamp = current_time; // 更新时间戳

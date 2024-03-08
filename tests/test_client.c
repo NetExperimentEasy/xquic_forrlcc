@@ -2247,11 +2247,11 @@ int main(int argc, char *argv[]) {
     } else if (c_cong_ctl == 'P') {
         cong_ctrl = xqc_copa_cb;  
     } 
-#ifdef XQC_ENABLE_BBR2
     /* add rlcc here */
     else if (c_cong_ctl == 'R') {
         cong_ctrl = xqc_rlcc_cb;
     }
+#ifdef XQC_ENABLE_BBR2
     else if (c_cong_ctl == 'B') {
         cong_ctrl = xqc_bbr2_cb;
         cong_flags = XQC_BBR2_FLAG_NONE;
@@ -2476,7 +2476,7 @@ int main(int argc, char *argv[]) {
 
             xqc_client_stream_send(user_stream->stream, user_stream);
         }
-    }
+    } 
 
     last_recv_ts = xqc_now();
     event_base_dispatch(eb);
